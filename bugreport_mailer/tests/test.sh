@@ -65,7 +65,7 @@ if [ -n "$UPLOAD_TOKEN" ]; then
   curl_args+=(-F "uploadToken=$UPLOAD_TOKEN")
 fi
 
-curl "${curl_args[@]}" "$URL"
+curl --fail-with-body "${curl_args[@]}" "$URL"
 
 echo ""
 echo "----------------------------------------------------------------"
