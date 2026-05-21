@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+
+.agents/
+
+bugreport_mailer/config.php
+bugreport_mailer/.user.ini
+bugreport_mailer/vendor/
+bugreport_mailer/bugreports/
+bugreport_mailer/runtime/
+bugreport_mailer/*.log
+bugreport_mailer/tests/*.zip
+bugreport_mailer/tests/test.log
+bugreport_mailer/tests/%1
