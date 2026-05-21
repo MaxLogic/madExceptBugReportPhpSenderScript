@@ -16,6 +16,7 @@ URL="${PUBLIC_URL%/}/bugreport_mailer.php"
 
 # The customer identifier we're testing for
 CUSTOMER="${CUSTOMER_IDENTIFIER:-example-customer}"
+UPLOAD_TOKEN="${BUGREPORT_UPLOAD_TOKEN:-}"
 
 ATTACHMENT1="${BUGREPORT_ATTACHMENT:-}"
 ATTACHMENT2="${SCREENSHOT_ATTACHMENT:-$SCRIPT_DIR/screen.png}"
@@ -48,16 +49,23 @@ fi
 echo "Preparing to send a test bug report for customer '$CUSTOMER' to $URL..."
 echo "----------------------------------------------------------------"
 
-curl -v \
-  -F "customerIdentifier=$CUSTOMER" \
-  -F "MailSubject=Test Bug Report from Script" \
-  -F "MailBody=This is the body of the test bug report. If you see this, it worked! (utf8Test: üÜöÖäÄß-ąĄęĘóÓłŁńŃśŚżŻźŹ)" \
-  -F "MailFrom=test-script@paws-server.com" \
-  -F "AppName=TestApp" \
-  -F "AppVersion=1.0.0" \
-  -F "bugreport=@$ATTACHMENT1" \
-  -F "screenshot=@$ATTACHMENT2" \
-  "$URL"
+curl_args=(
+  -v
+  -F "customerIdentifier=$CUSTOMER"
+  -F "MailSubject=Test Bug Report from Script"
+  -F "MailBody=This is the body of the test bug report. If you see this, it worked! (utf8Test: üÜöÖäÄß-ąĄęĘóÓłŁńŃśŚżŻźŹ)"
+  -F "MailFrom=test-script@paws-server.com"
+  -F "AppName=TestApp"
+  -F "AppVersion=1.0.0"
+  -F "bugreport=@$ATTACHMENT1"
+  -F "screenshot=@$ATTACHMENT2"
+)
+
+if [ -n "$UPLOAD_TOKEN" ]; then
+  curl_args+=(-F "uploadToken=$UPLOAD_TOKEN")
+fi
+
+curl "${curl_args[@]}" "$URL"
 
 echo ""
 echo "----------------------------------------------------------------"

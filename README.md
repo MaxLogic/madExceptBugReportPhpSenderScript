@@ -77,6 +77,8 @@ Edit `config.php` on the deployment host:
 - `storage_dir`: directory for uploaded report attachments.
 - `database_path`: SQLite queue database path.
 - `request_limits`: upload and rate limits.
+- `security`: HTTPS enforcement options.
+- `monitoring`: security event digest settings.
 - `worker`: queue worker batch size, retry schedule, and lock file.
 - `maintenance`: stale-send recovery and retention settings.
 
@@ -111,10 +113,59 @@ Required form fields:
 Optional form fields:
 
 - `MailFrom`: validated email address used as the reply-to address.
+- `uploadToken` or `UploadToken`: required only for customers that configure `upload_token_sha256`.
 - Any other scalar fields: stored and appended under `--- Sender Information ---`.
 - Uploaded files: stored as attachments and sent by the worker.
 
 The script stores reports before sending them. It does not send email during the HTTP request.
+
+## Abuse Protection
+
+The endpoint is designed to remain backwards compatible with already deployed Delphi applications. Existing customer entries can still be configured as a plain recipient list:
+
+```php
+'legacy-customer' => [
+    'support@example.com',
+],
+```
+
+That form accepts the `customerIdentifier` without an upload token. This is intentionally supported for compatibility, but new deployments should use token-protected customer config:
+
+```php
+'example-customer' => [
+    'recipients' => [
+        'support@example.com',
+    ],
+    'upload_token_sha256' => hash('sha256', 'long-random-token-here'),
+],
+```
+
+Clients then send the plain token as either:
+
+- `uploadToken` form field
+- `UploadToken` form field
+- `X-Bugreport-Token` HTTP header
+
+The token is stored in the PHP config only as a SHA-256 hash and compared with `hash_equals()`. For Delphi desktop applications this is not a perfect secret because a determined attacker can inspect a deployed binary, but it prevents casual endpoint abuse by people who only know the URL and customer identifier.
+
+Default rate and resource limits:
+
+- 3 reports per minute per IP.
+- 30 reports per hour per IP.
+- 50 reports per hour per customer.
+- 100 total reports per hour.
+- 300 queued reports maximum.
+- 10 MB maximum request size.
+- 4 attachments maximum.
+- 8 MB maximum per attachment.
+- 250 MB maximum attachment storage.
+- Attachment extensions limited to `.zip`, `.txt`, `.log`, `.png`, `.jpg`, and `.jpeg`.
+
+Rejected abuse-related requests are written to `monitoring.event_log_file`. `maintenance.php` periodically sends a digest email to `my_email` and clears the event log after a successful digest. This avoids sending one alert email per rejected request.
+
+The upload endpoint enforces HTTPS by default. If PHP runs behind a reverse proxy or hosting layer, `security.trust_forwarded_proto` allows `X-Forwarded-Proto: https` to satisfy that check.
+
+The tracked `.htaccess` disables directory indexes, denies direct access to sensitive runtime file names, and blocks HTTP access to `bugreports/`, `runtime/`, and `vendor/` on Apache-compatible hosts.
 
 ## Queue Worker
 
@@ -161,6 +212,7 @@ Optional overrides:
 
 ```bash
 CUSTOMER_IDENTIFIER=example-customer \
+BUGREPORT_UPLOAD_TOKEN=long-random-token-here \
 BUGREPORT_ATTACHMENT=/path/to/bugreport.zip \
 SCREENSHOT_ATTACHMENT=/path/to/screen.png \
 ./test.sh
@@ -175,6 +227,7 @@ Typical setup:
 ```delphi
 uses
   System.SysUtils,
+  madExcept,
   maxLogic.MadExcept;
 
 procedure ConfigureBugReports;
@@ -185,6 +238,8 @@ begin
     'https://example.com/bugreport_mailer/bugreport_mailer.php',
     'example-customer'
   );
+
+  MESettings.AdditionalFields['uploadToken'] := 'long-random-token-here';
 
   AddFieldToBugReportHeader('Environment', 'Production');
   AddFieldToBugReportHeader('Channel', 'Stable');
@@ -212,6 +267,7 @@ begin
   Settings.HttpPort := 0;
   Settings.AdditionalFields['BugReportField'] := 'bugreport';
   Settings.AdditionalFields['customerIdentifier'] := 'example-customer';
+  Settings.AdditionalFields['uploadToken'] := 'long-random-token-here';
 end;
 ```
 
@@ -221,5 +277,6 @@ end;
 - Keep customer routing and real email addresses in `config.php`, not in `config.example.php`.
 - Keep SMTP credentials in `config.php` or server environment only.
 - Keep the upload endpoint behind HTTPS.
+- Prefer token-protected customer entries for new Delphi releases; keep tokenless entries only where backwards compatibility is required.
 - Treat uploaded reports as sensitive diagnostic data. They may include paths, screenshots, user data, stack traces, and local machine details.
 - Run the worker and maintenance scripts as CLI tasks, not through public HTTP endpoints.

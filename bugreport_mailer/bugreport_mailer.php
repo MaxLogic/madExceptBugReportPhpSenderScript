@@ -16,6 +16,8 @@ try {
     rotateLogFile($logFile, (int) $config['log_rotation_max_bytes']);
     writeMailerLog($logFile, '--- Bugreport Upload Attempt ---');
 
+    enforceHttps($config, $logFile);
+
     if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
         httpError($logFile, 'Invalid request method', 405);
     }

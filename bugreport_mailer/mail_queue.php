@@ -26,9 +26,24 @@ function loadMailerConfig(string $configPath): array
         'request_limits' => [
             'per_minute' => 3,
             'per_hour' => 30,
+            'per_customer_per_hour' => 50,
+            'global_per_hour' => 100,
+            'max_queued_reports' => 300,
             'max_request_bytes' => 10 * 1024 * 1024,
             'max_attachment_count' => 4,
             'max_attachment_bytes' => 8 * 1024 * 1024,
+            'max_storage_bytes' => 250 * 1024 * 1024,
+            'allowed_attachment_extensions' => ['zip', 'txt', 'log', 'png', 'jpg', 'jpeg'],
+        ],
+        'security' => [
+            'require_https' => true,
+            'trust_forwarded_proto' => true,
+        ],
+        'monitoring' => [
+            'event_log_file' => __DIR__ . '/runtime/security_events.log',
+            'last_digest_file' => __DIR__ . '/runtime/security_digest_sent_at',
+            'digest_interval_seconds' => 3600,
+            'max_digest_lines' => 200,
         ],
         'worker' => [
             'batch_size' => 10,
@@ -68,15 +83,22 @@ function loadMailerConfig(string $configPath): array
     assertPositiveIntConfig($config['log_rotation_max_bytes'], 'log_rotation_max_bytes');
     validateNestedIntConfig($config, ['request_limits', 'per_minute']);
     validateNestedIntConfig($config, ['request_limits', 'per_hour']);
+    validateNestedIntConfig($config, ['request_limits', 'per_customer_per_hour']);
+    validateNestedIntConfig($config, ['request_limits', 'global_per_hour']);
+    validateNestedIntConfig($config, ['request_limits', 'max_queued_reports']);
     validateNestedIntConfig($config, ['request_limits', 'max_request_bytes']);
     validateNestedIntConfig($config, ['request_limits', 'max_attachment_count']);
     validateNestedIntConfig($config, ['request_limits', 'max_attachment_bytes']);
+    validateNestedIntConfig($config, ['request_limits', 'max_storage_bytes']);
     validateNestedIntConfig($config, ['worker', 'batch_size']);
     validateNestedIntConfig($config, ['worker', 'sleep_between_messages_ms'], true);
     validateNestedIntConfig($config, ['maintenance', 'stale_sending_after_seconds']);
     validateNestedIntConfig($config, ['maintenance', 'sent_report_retention_days']);
     validateNestedIntConfig($config, ['maintenance', 'dead_report_retention_days']);
     validateNestedIntConfig($config, ['maintenance', 'log_retention_days']);
+    validateNestedIntConfig($config, ['monitoring', 'digest_interval_seconds']);
+    validateNestedIntConfig($config, ['monitoring', 'max_digest_lines']);
+    validateStringListConfig($config['request_limits']['allowed_attachment_extensions'], 'request_limits.allowed_attachment_extensions');
     if (!isset($config['worker']['retry_schedule_seconds']) || !is_array($config['worker']['retry_schedule_seconds']) || $config['worker']['retry_schedule_seconds'] === []) {
         throw new RuntimeException('worker.retry_schedule_seconds must be a non-empty array');
     }
@@ -114,6 +136,22 @@ function validateNestedIntConfig(array $config, array $path, bool $allowZero = f
     }
 
     assertPositiveIntConfig($value, implode('.', $path), $allowZero);
+}
+
+/**
+ * @param mixed $value
+ */
+function validateStringListConfig($value, string $name): void
+{
+    if (!is_array($value) || $value === []) {
+        throw new RuntimeException("Invalid list config value: {$name}");
+    }
+
+    foreach ($value as $item) {
+        if (!is_string($item) || trim($item) === '') {
+            throw new RuntimeException("Invalid list config value: {$name}");
+        }
+    }
 }
 
 function utcNow(): string
@@ -184,6 +222,69 @@ function httpError(?string $logFile, string $clientMessage, int $httpCode, ?stri
     http_response_code($httpCode);
     echo $clientMessage;
     exit;
+}
+
+/**
+ * @param array<string, mixed> $config
+ */
+function recordSecurityEvent(array $config, ?string $logFile, string $eventType, string $message): void
+{
+    $eventLog = $config['monitoring']['event_log_file'] ?? null;
+    if (!is_string($eventLog) || $eventLog === '') {
+        writeMailerLog($logFile, 'SECURITY ' . $eventType . ': ' . $message);
+        return;
+    }
+
+    ensureDirectoryExists(dirname($eventLog));
+    $ip = $_SERVER['REMOTE_ADDR'] ?? 'CLI';
+    $line = sprintf("[%s] [%s] [%s] %s\n", date('Y-m-d H:i:s'), $ip, $eventType, $message);
+    if (@file_put_contents($eventLog, $line, FILE_APPEND | LOCK_EX) === false) {
+        writeMailerLog($logFile, 'SECURITY ' . $eventType . ': ' . $message);
+    }
+}
+
+/**
+ * @param array<string, mixed> $config
+ */
+function rejectRequest(array $config, ?string $logFile, string $eventType, string $clientMessage, int $httpCode, string $logMessage): void
+{
+    recordSecurityEvent($config, $logFile, $eventType, $logMessage);
+    httpError($logFile, $clientMessage, $httpCode, $logMessage);
+}
+
+/**
+ * @param array<string, mixed> $config
+ */
+function enforceHttps(array $config, ?string $logFile): void
+{
+    if (empty($config['security']['require_https']) || isHttpsRequest($config)) {
+        return;
+    }
+
+    rejectRequest($config, $logFile, 'insecure_request', 'HTTPS required', 403, 'Rejected non-HTTPS upload request.');
+}
+
+/**
+ * @param array<string, mixed> $config
+ */
+function isHttpsRequest(array $config): bool
+{
+    if (isset($_SERVER['HTTPS']) && strtolower((string) $_SERVER['HTTPS']) === 'on') {
+        return true;
+    }
+
+    if (isset($_SERVER['SERVER_PORT']) && (string) $_SERVER['SERVER_PORT'] === '443') {
+        return true;
+    }
+
+    if (!empty($config['security']['trust_forwarded_proto'])) {
+        $forwardedProto = strtolower((string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? ''));
+        if ($forwardedProto === 'https') {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 /**
@@ -310,7 +411,7 @@ function buildExtraPostFields(): array
 {
     $extra = [];
     foreach ($_POST as $key => $value) {
-        if (in_array($key, ['BugReportField', 'MailSubject', 'MailBody', 'customerIdentifier'], true)) {
+        if (in_array($key, ['BugReportField', 'MailSubject', 'MailBody', 'customerIdentifier', 'uploadToken', 'UploadToken'], true)) {
             continue;
         }
 
@@ -342,7 +443,8 @@ function resolveRecipients(array $config, string $customerIdentifier, ?string $l
 {
     $recipients = [$config['my_email']];
 
-    $customerRecipients = $config['customers'][$customerIdentifier];
+    $customerConfig = getCustomerConfig($config, $customerIdentifier);
+    $customerRecipients = $customerConfig['recipients'];
     if (!is_array($customerRecipients)) {
         writeMailerLog($logFile, "WARNING: Customer '{$customerIdentifier}' has non-array recipients in config.");
     } else {
@@ -372,11 +474,70 @@ function resolveRecipients(array $config, string $customerIdentifier, ?string $l
 function ensureKnownCustomerIdentifier(array $config, string $customerIdentifier, ?string $logFile): void
 {
     if (!array_key_exists($customerIdentifier, $config['customers'])) {
-        httpError(
+        rejectRequest(
+            $config,
             $logFile,
+            'unknown_customer',
             'Unknown customer identifier',
             400,
             "Rejected unknown customer identifier '{$customerIdentifier}'."
+        );
+    }
+}
+
+/**
+ * @param array<string, mixed> $config
+ * @return array{recipients:mixed, upload_token_sha256:?string}
+ */
+function getCustomerConfig(array $config, string $customerIdentifier): array
+{
+    $customer = $config['customers'][$customerIdentifier];
+    if (is_array($customer) && array_key_exists('recipients', $customer)) {
+        return [
+            'recipients' => $customer['recipients'],
+            'upload_token_sha256' => isset($customer['upload_token_sha256']) && is_string($customer['upload_token_sha256'])
+                ? trim($customer['upload_token_sha256'])
+                : null,
+        ];
+    }
+
+    return [
+        'recipients' => $customer,
+        'upload_token_sha256' => null,
+    ];
+}
+
+/**
+ * @param array<string, mixed> $config
+ */
+function verifyUploadToken(array $config, string $customerIdentifier, ?string $logFile): void
+{
+    $customerConfig = getCustomerConfig($config, $customerIdentifier);
+    $expectedHash = $customerConfig['upload_token_sha256'];
+    if ($expectedHash === null || $expectedHash === '') {
+        return;
+    }
+
+    $token = null;
+    foreach (['uploadToken', 'UploadToken'] as $field) {
+        if (isset($_POST[$field]) && is_string($_POST[$field])) {
+            $token = $_POST[$field];
+            break;
+        }
+    }
+
+    if ($token === null && isset($_SERVER['HTTP_X_BUGREPORT_TOKEN'])) {
+        $token = (string) $_SERVER['HTTP_X_BUGREPORT_TOKEN'];
+    }
+
+    if (!is_string($token) || $token === '' || !hash_equals($expectedHash, hash('sha256', $token))) {
+        rejectRequest(
+            $config,
+            $logFile,
+            'invalid_upload_token',
+            'Unauthorized',
+            401,
+            "Rejected invalid upload token for customer '{$customerIdentifier}'."
         );
     }
 }
@@ -437,11 +598,11 @@ function uploadErrorLabel(int $errorCode): string
  * @param array<string, mixed> $config
  * @param list<array{name:string,tmp_name:string,error:int,size:int}> $uploads
  */
-function validateRequestLimits(array $config, array $uploads, string $remoteIp, PDO $pdo, ?string $logFile): void
+function validateRequestLimits(array $config, array $uploads, string $remoteIp, string $customerIdentifier, PDO $pdo, ?string $logFile): void
 {
     $contentLength = isset($_SERVER['CONTENT_LENGTH']) ? (int) $_SERVER['CONTENT_LENGTH'] : 0;
     if ($contentLength > (int) $config['request_limits']['max_request_bytes']) {
-        httpError($logFile, 'Request too large', 413);
+        rejectRequest($config, $logFile, 'request_too_large', 'Request too large', 413, 'Rejected oversized request.');
     }
 
     $actualUploads = [];
@@ -452,32 +613,59 @@ function validateRequestLimits(array $config, array $uploads, string $remoteIp, 
     }
 
     if (count($actualUploads) > (int) $config['request_limits']['max_attachment_count']) {
-        httpError($logFile, 'Too many attachments', 400);
+        rejectRequest($config, $logFile, 'too_many_attachments', 'Too many attachments', 400, 'Rejected request with too many attachments.');
     }
 
+    $uploadBytes = 0;
     foreach ($actualUploads as $upload) {
+        $uploadBytes += max(0, (int) $upload['size']);
         if ($upload['size'] > (int) $config['request_limits']['max_attachment_bytes']) {
-            httpError($logFile, 'Attachment too large', 413, "Rejected oversized attachment '{$upload['name']}'");
+            rejectRequest($config, $logFile, 'attachment_too_large', 'Attachment too large', 413, "Rejected oversized attachment '{$upload['name']}'");
         }
 
         if ($upload['error'] !== UPLOAD_ERR_OK) {
-            httpError(
+            rejectRequest(
+                $config,
                 $logFile,
+                'attachment_upload_failed',
                 'Attachment upload failed',
                 400,
                 sprintf("Upload error for '%s': %s", $upload['name'], uploadErrorLabel($upload['error']))
             );
         }
+
+        validateAttachmentExtension($config, $upload['name'], $logFile);
+    }
+
+    $maxStorageBytes = (int) $config['request_limits']['max_storage_bytes'];
+    $currentStorageBytes = directorySize((string) $config['storage_dir']);
+    if ($currentStorageBytes + $uploadBytes > $maxStorageBytes) {
+        rejectRequest($config, $logFile, 'storage_limit_exceeded', 'Storage limit exceeded', 507, 'Rejected upload because attachment storage limit would be exceeded.');
     }
 
     $perMinute = countRecentReportsByIp($pdo, $remoteIp, 60);
     if ($perMinute >= (int) $config['request_limits']['per_minute']) {
-        httpError($logFile, 'Rate limit exceeded', 429, 'Per-minute rate limit exceeded for IP ' . $remoteIp);
+        rejectRequest($config, $logFile, 'ip_rate_limit', 'Rate limit exceeded', 429, 'Per-minute rate limit exceeded for IP ' . $remoteIp);
     }
 
     $perHour = countRecentReportsByIp($pdo, $remoteIp, 3600);
     if ($perHour >= (int) $config['request_limits']['per_hour']) {
-        httpError($logFile, 'Rate limit exceeded', 429, 'Per-hour rate limit exceeded for IP ' . $remoteIp);
+        rejectRequest($config, $logFile, 'ip_rate_limit', 'Rate limit exceeded', 429, 'Per-hour rate limit exceeded for IP ' . $remoteIp);
+    }
+
+    $perCustomerHour = countRecentReportsByCustomer($pdo, $customerIdentifier, 3600);
+    if ($perCustomerHour >= (int) $config['request_limits']['per_customer_per_hour']) {
+        rejectRequest($config, $logFile, 'customer_rate_limit', 'Rate limit exceeded', 429, "Per-hour rate limit exceeded for customer '{$customerIdentifier}'.");
+    }
+
+    $globalHour = countRecentReports($pdo, 3600);
+    if ($globalHour >= (int) $config['request_limits']['global_per_hour']) {
+        rejectRequest($config, $logFile, 'global_rate_limit', 'Rate limit exceeded', 429, 'Global per-hour rate limit exceeded.');
+    }
+
+    $queuedReports = countReportsByStatus($pdo, 'queued');
+    if ($queuedReports >= (int) $config['request_limits']['max_queued_reports']) {
+        rejectRequest($config, $logFile, 'queue_limit', 'Queue is full', 503, 'Rejected upload because queue limit is reached.');
     }
 }
 
@@ -494,6 +682,79 @@ function countRecentReportsByIp(PDO $pdo, string $remoteIp, int $windowSeconds):
     ]);
 
     return (int) $statement->fetchColumn();
+}
+
+function countRecentReportsByCustomer(PDO $pdo, string $customerIdentifier, int $windowSeconds): int
+{
+    $statement = $pdo->prepare(
+        'SELECT COUNT(*) FROM reports
+         WHERE customer_identifier = :customer_identifier
+           AND received_at >= :cutoff'
+    );
+    $statement->execute([
+        ':customer_identifier' => $customerIdentifier,
+        ':cutoff' => utcOffsetSeconds(-$windowSeconds),
+    ]);
+
+    return (int) $statement->fetchColumn();
+}
+
+function countRecentReports(PDO $pdo, int $windowSeconds): int
+{
+    $statement = $pdo->prepare(
+        'SELECT COUNT(*) FROM reports
+         WHERE received_at >= :cutoff'
+    );
+    $statement->execute([':cutoff' => utcOffsetSeconds(-$windowSeconds)]);
+
+    return (int) $statement->fetchColumn();
+}
+
+function countReportsByStatus(PDO $pdo, string $status): int
+{
+    $statement = $pdo->prepare('SELECT COUNT(*) FROM reports WHERE status = :status');
+    $statement->execute([':status' => $status]);
+
+    return (int) $statement->fetchColumn();
+}
+
+/**
+ * @param array<string, mixed> $config
+ */
+function validateAttachmentExtension(array $config, string $fileName, ?string $logFile): void
+{
+    $extension = strtolower(pathinfo($fileName, PATHINFO_EXTENSION));
+    $allowed = array_map(
+        static function (string $item): string {
+            return strtolower(ltrim($item, '.'));
+        },
+        $config['request_limits']['allowed_attachment_extensions']
+    );
+
+    if ($extension === '' || !in_array($extension, $allowed, true)) {
+        rejectRequest($config, $logFile, 'blocked_attachment_extension', 'Attachment type not allowed', 400, "Rejected attachment '{$fileName}' because its extension is not allowed.");
+    }
+}
+
+function directorySize(string $path): int
+{
+    if (!is_dir($path)) {
+        return 0;
+    }
+
+    $total = 0;
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::SELF_FIRST
+    );
+
+    foreach ($iterator as $item) {
+        if ($item instanceof SplFileInfo && $item->isFile()) {
+            $total += $item->getSize();
+        }
+    }
+
+    return $total;
 }
 
 function detectMimeType(string $path): ?string
@@ -610,9 +871,10 @@ function enqueueCurrentRequest(PDO $pdo, array $config, ?string $logFile): int
     }
 
     ensureKnownCustomerIdentifier($config, $customerIdentifier, $logFile);
+    verifyUploadToken($config, $customerIdentifier, $logFile);
 
     $uploads = normalizeIncomingUploads($_FILES);
-    validateRequestLimits($config, $uploads, $remoteIp, $pdo, $logFile);
+    validateRequestLimits($config, $uploads, $remoteIp, $customerIdentifier, $pdo, $logFile);
 
     $extraFields = buildExtraPostFields();
     $storedBody = buildStoredMailBody($mailBody, $extraFields);
@@ -908,8 +1170,63 @@ function runQueueMaintenance(PDO $pdo, array $config, ?string $logFile): void
     resetStaleSendingReports($pdo, (int) $config['maintenance']['stale_sending_after_seconds']);
     cleanupRetiredReports($pdo, 'sent', (int) $config['maintenance']['sent_report_retention_days'], $logFile);
     cleanupRetiredReports($pdo, 'dead', (int) $config['maintenance']['dead_report_retention_days'], $logFile);
+    try {
+        sendSecurityDigest($config, $logFile);
+    } catch (Throwable $throwable) {
+        writeMailerLog($logFile, 'Security digest failed: ' . $throwable->getMessage());
+    }
 
     writeMailerLog($logFile, 'Queue maintenance finished successfully.');
+}
+
+/**
+ * @param array<string, mixed> $config
+ */
+function sendSecurityDigest(array $config, ?string $logFile): void
+{
+    $eventLog = $config['monitoring']['event_log_file'];
+    if (!is_string($eventLog) || !is_file($eventLog) || filesize($eventLog) === 0) {
+        return;
+    }
+
+    $lastDigestFile = $config['monitoring']['last_digest_file'];
+    $interval = (int) $config['monitoring']['digest_interval_seconds'];
+    if (is_string($lastDigestFile) && is_file($lastDigestFile) && filemtime($lastDigestFile) > time() - $interval) {
+        return;
+    }
+
+    $lines = @file($eventLog, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    if ($lines === false || $lines === []) {
+        return;
+    }
+
+    $maxLines = (int) $config['monitoring']['max_digest_lines'];
+    $selected = array_slice($lines, -$maxLines);
+    $omitted = max(0, count($lines) - count($selected));
+    $body = "Security events were recorded by the bug report mailer.\n\n";
+    if ($omitted > 0) {
+        $body .= "Showing the newest {$maxLines} event(s); {$omitted} older event(s) omitted.\n\n";
+    }
+
+    $body .= implode("\n", $selected);
+
+    $email = (new Email())
+        ->from($config['sender'])
+        ->to($config['my_email'])
+        ->subject('Bug report mailer security digest')
+        ->text($body);
+
+    $transport = Transport::fromDsn($config['mailer_dsn']);
+    $mailer = new Mailer($transport);
+    $mailer->send($email);
+
+    if (is_string($lastDigestFile) && $lastDigestFile !== '') {
+        ensureDirectoryExists(dirname($lastDigestFile));
+        @file_put_contents($lastDigestFile, (string) time(), LOCK_EX);
+    }
+
+    @file_put_contents($eventLog, '', LOCK_EX);
+    writeMailerLog($logFile, 'Sent security digest with ' . count($lines) . ' event(s).');
 }
 
 function resetStaleSendingReports(PDO $pdo, int $staleAfterSeconds): void
