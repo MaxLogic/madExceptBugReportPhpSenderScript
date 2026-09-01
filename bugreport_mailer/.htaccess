@@ -9,6 +9,15 @@ Options -Indexes
     </IfModule>
 </FilesMatch>
 
+<FilesMatch "^(send_queued_reports|maintenance)\.php$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
 <IfModule mod_rewrite.c>
     RewriteEngine On
     RewriteRule ^(bugreports|runtime|vendor)/ - [F,L]

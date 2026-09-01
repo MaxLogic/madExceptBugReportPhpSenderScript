@@ -288,4 +288,4 @@ end;
 - Keep the upload endpoint behind HTTPS.
 - Prefer token-protected customer entries for new Delphi releases; keep tokenless entries only where backwards compatibility is required.
 - Treat uploaded reports as sensitive diagnostic data. They may include paths, screenshots, user data, stack traces, and local machine details.
-- Run the worker and maintenance scripts as CLI tasks, not through public HTTP endpoints.
+- Run the worker and maintenance scripts as CLI tasks. Direct HTTP access to both entrypoints is denied by `.htaccess` and rejected by the scripts themselves.
