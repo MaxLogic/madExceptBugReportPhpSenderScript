@@ -88,7 +88,7 @@ If the host supports per-directory `.user.ini`, copy the example and adjust it l
 cp .user.ini.example .user.ini
 ```
 
-The example enables PHP error logging, writes errors to `php_errors.log`, reports all errors, and keeps errors hidden from HTTP responses.
+The example enables PHP error logging, keeps errors hidden from HTTP responses, allows attachments up to 50 MiB, and sets a 64 MiB POST ceiling to leave room for multipart form overhead.
 
 ## Web Server
 
@@ -155,13 +155,15 @@ Default rate and resource limits:
 - 50 reports per hour per customer.
 - 100 total reports per hour.
 - 300 queued reports maximum.
-- 10 MB maximum request size.
+- 50 MiB maximum request size.
 - 4 attachments maximum.
-- 8 MB maximum per attachment.
+- 50 MiB maximum per attachment.
 - 250 MB maximum attachment storage.
 - Attachment extensions limited to `.zip`, `.txt`, `.log`, `.png`, `.jpg`, and `.jpeg`.
 
-Rejected abuse-related requests are written to `monitoring.event_log_file`. `maintenance.php` periodically sends a digest email to `my_email` and clears the event log after a successful digest. This avoids sending one alert email per rejected request.
+Rejected requests are written to `monitoring.event_log_file` with the submitted sender address, sender name, subject, customer identifier, declared request size, and attachment metadata. `maintenance.php` periodically sends these details in a digest email to `my_email` and clears the event log after a successful digest. This avoids sending one alert email per rejected request.
+
+For rejected size-limit requests, the mailer looks inside uploaded ZIP files for `bugreport.txt` and then `bugreport.log`. A matching file is attached to the digest when its uncompressed size does not exceed `monitoring.max_diagnostic_bytes`, which defaults to 1 MiB. Diagnostic spool storage and total digest attachments are capped by `monitoring.max_diagnostic_storage_bytes`, which defaults to 10 MiB. Archive paths are not extracted. Temporary digest attachments are removed after successful mail and expired by maintenance after the configured log-retention period.
 
 The upload endpoint enforces HTTPS by default. If PHP runs behind a reverse proxy or hosting layer, `security.trust_forwarded_proto` allows `X-Forwarded-Proto: https` to satisfy that check.
 
@@ -183,7 +185,14 @@ Run maintenance periodically:
 php /path/to/bugreport_mailer/maintenance.php
 ```
 
-Maintenance resets stale `sending` reports, removes expired sent/dead reports and their attachments, and prunes rotated logs.
+Maintenance resets stale `sending` reports, removes expired sent/dead reports and their attachments, prunes rotated logs, sends security digests, and removes expired diagnostic attachments.
+
+Run the local security-event regression test with:
+
+```bash
+cd bugreport_mailer
+php tests/security_events_test.php
+```
 
 ## Smoke Test
 

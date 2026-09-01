@@ -19,9 +19,9 @@ return [
         'per_customer_per_hour' => 50,
         'global_per_hour' => 100,
         'max_queued_reports' => 300,
-        'max_request_bytes' => 10 * 1024 * 1024,
+        'max_request_bytes' => 50 * 1024 * 1024,
         'max_attachment_count' => 4,
-        'max_attachment_bytes' => 8 * 1024 * 1024,
+        'max_attachment_bytes' => 50 * 1024 * 1024,
         'max_storage_bytes' => 250 * 1024 * 1024,
         'allowed_attachment_extensions' => ['zip', 'txt', 'log', 'png', 'jpg', 'jpeg'],
     ],
@@ -34,8 +34,11 @@ return [
     'monitoring' => [
         'event_log_file' => __DIR__ . '/runtime/security_events.log',
         'last_digest_file' => __DIR__ . '/runtime/security_digest_sent_at',
+        'event_attachment_dir' => __DIR__ . '/runtime/security_event_attachments',
         'digest_interval_seconds' => 3600,
         'max_digest_lines' => 200,
+        'max_diagnostic_bytes' => 1024 * 1024,
+        'max_diagnostic_storage_bytes' => 10 * 1024 * 1024,
     ],
 
     'worker' => [

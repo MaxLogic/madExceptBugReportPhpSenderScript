@@ -7,6 +7,8 @@ use Symfony\Component\Mailer\Transport;
 use Symfony\Component\Mime\Email;
 
 const MAIL_QUEUE_DEFAULT_LOG_FILE = __DIR__ . '/bugreport_mailer.log';
+const SECURITY_DIAGNOSTIC_MAX_ZIP_ENTRIES = 1000;
+const SECURITY_EVENT_MAX_LOGGED_ATTACHMENTS = 20;
 
 /**
  * @return array<string, mixed>
@@ -29,9 +31,9 @@ function loadMailerConfig(string $configPath): array
             'per_customer_per_hour' => 50,
             'global_per_hour' => 100,
             'max_queued_reports' => 300,
-            'max_request_bytes' => 10 * 1024 * 1024,
+            'max_request_bytes' => 50 * 1024 * 1024,
             'max_attachment_count' => 4,
-            'max_attachment_bytes' => 8 * 1024 * 1024,
+            'max_attachment_bytes' => 50 * 1024 * 1024,
             'max_storage_bytes' => 250 * 1024 * 1024,
             'allowed_attachment_extensions' => ['zip', 'txt', 'log', 'png', 'jpg', 'jpeg'],
         ],
@@ -42,8 +44,11 @@ function loadMailerConfig(string $configPath): array
         'monitoring' => [
             'event_log_file' => __DIR__ . '/runtime/security_events.log',
             'last_digest_file' => __DIR__ . '/runtime/security_digest_sent_at',
+            'event_attachment_dir' => __DIR__ . '/runtime/security_event_attachments',
             'digest_interval_seconds' => 3600,
             'max_digest_lines' => 200,
+            'max_diagnostic_bytes' => 1024 * 1024,
+            'max_diagnostic_storage_bytes' => 10 * 1024 * 1024,
         ],
         'worker' => [
             'batch_size' => 10,
@@ -98,6 +103,13 @@ function loadMailerConfig(string $configPath): array
     validateNestedIntConfig($config, ['maintenance', 'log_retention_days']);
     validateNestedIntConfig($config, ['monitoring', 'digest_interval_seconds']);
     validateNestedIntConfig($config, ['monitoring', 'max_digest_lines']);
+    validateNestedIntConfig($config, ['monitoring', 'max_diagnostic_bytes']);
+    validateNestedIntConfig($config, ['monitoring', 'max_diagnostic_storage_bytes']);
+    foreach (['event_log_file', 'last_digest_file', 'event_attachment_dir'] as $key) {
+        if (!isset($config['monitoring'][$key]) || !is_string($config['monitoring'][$key]) || trim($config['monitoring'][$key]) === '') {
+            throw new RuntimeException("Missing or invalid config value: monitoring.{$key}");
+        }
+    }
     validateStringListConfig($config['request_limits']['allowed_attachment_extensions'], 'request_limits.allowed_attachment_extensions');
     if (!isset($config['worker']['retry_schedule_seconds']) || !is_array($config['worker']['retry_schedule_seconds']) || $config['worker']['retry_schedule_seconds'] === []) {
         throw new RuntimeException('worker.retry_schedule_seconds must be a non-empty array');
@@ -224,32 +236,350 @@ function httpError(?string $logFile, string $clientMessage, int $httpCode, ?stri
     exit;
 }
 
-/**
- * @param array<string, mixed> $config
- */
-function recordSecurityEvent(array $config, ?string $logFile, string $eventType, string $message): void
+function sanitizeSecurityEventValue(string $value, int $maxLength = 500): string
 {
-    $eventLog = $config['monitoring']['event_log_file'] ?? null;
-    if (!is_string($eventLog) || $eventLog === '') {
-        writeMailerLog($logFile, 'SECURITY ' . $eventType . ': ' . $message);
-        return;
+    $sanitized = preg_replace('/[\x00-\x1F\x7F]+/', ' ', $value);
+    if (!is_string($sanitized)) {
+        $sanitized = '';
     }
 
-    ensureDirectoryExists(dirname($eventLog));
-    $ip = $_SERVER['REMOTE_ADDR'] ?? 'CLI';
-    $line = sprintf("[%s] [%s] [%s] %s\n", date('Y-m-d H:i:s'), $ip, $eventType, $message);
-    if (@file_put_contents($eventLog, $line, FILE_APPEND | LOCK_EX) === false) {
-        writeMailerLog($logFile, 'SECURITY ' . $eventType . ': ' . $message);
+    $sanitized = trim(preg_replace('/ +/', ' ', $sanitized) ?? $sanitized);
+    if (strlen($sanitized) > $maxLength) {
+        return substr($sanitized, 0, $maxLength) . '...';
     }
+
+    return $sanitized;
+}
+
+/**
+ * @param list<string> $keys
+ */
+function firstSecurityPostValue(array $keys): ?string
+{
+    foreach ($keys as $key) {
+        if (isset($_POST[$key]) && is_string($_POST[$key]) && trim($_POST[$key]) !== '') {
+            return sanitizeSecurityEventValue($_POST[$key]);
+        }
+    }
+
+    return null;
+}
+
+/**
+ * @param list<array{name:string,tmp_name:string,error:int,size:int}>|null $uploads
+ * @return array<string, mixed>
+ */
+function collectRequestSecurityDetails(?array $uploads = null): array
+{
+    if ($uploads === null) {
+        try {
+            $uploads = normalizeIncomingUploads(isset($_FILES) && is_array($_FILES) ? $_FILES : []);
+        } catch (Throwable $throwable) {
+            $uploads = [];
+        }
+    }
+
+    $attachmentDetails = [];
+    $omittedAttachments = 0;
+    foreach ($uploads as $upload) {
+        if ($upload['error'] === UPLOAD_ERR_NO_FILE) {
+            continue;
+        }
+
+        if (count($attachmentDetails) >= SECURITY_EVENT_MAX_LOGGED_ATTACHMENTS) {
+            $omittedAttachments++;
+            continue;
+        }
+
+        $attachmentDetails[] = [
+            'name' => sanitizeSecurityEventValue($upload['name'], 255),
+            'size_bytes' => max(0, (int) $upload['size']),
+            'upload_status' => $upload['error'] === UPLOAD_ERR_OK ? 'OK' : uploadErrorLabel($upload['error']),
+        ];
+    }
+
+    $details = [
+        'from_address' => firstSecurityPostValue(['MailFrom']),
+        'from_name' => firstSecurityPostValue(['MailFromName', 'FromName']),
+        'subject' => firstSecurityPostValue(['MailSubject']),
+        'customer_identifier' => firstSecurityPostValue(['customerIdentifier']),
+        'request_size_bytes' => isset($_SERVER['CONTENT_LENGTH']) ? max(0, (int) $_SERVER['CONTENT_LENGTH']) : 0,
+        'attachments' => $attachmentDetails,
+    ];
+    if ($omittedAttachments > 0) {
+        $details['attachments_omitted'] = $omittedAttachments;
+    }
+
+    return $details;
+}
+
+function readSecurityDiagnosticEntry(PharFileInfo $entry, int $maxBytes): ?string
+{
+    $file = $entry->openFile('rb');
+    $content = '';
+    while (!$file->eof() && strlen($content) <= $maxBytes) {
+        $remaining = ($maxBytes + 1) - strlen($content);
+        if ($remaining <= 0) {
+            break;
+        }
+
+        $chunk = $file->fread(min(8192, $remaining));
+        if ($chunk === '') {
+            break;
+        }
+
+        $content .= $chunk;
+    }
+
+    return strlen($content) <= $maxBytes ? $content : null;
 }
 
 /**
  * @param array<string, mixed> $config
+ * @param list<array{name:string,tmp_name:string,error:int,size:int}> $uploads
+ * @return array{status:string,attachment?:array{path:string,name:string,size_bytes:int}}
  */
-function rejectRequest(array $config, ?string $logFile, string $eventType, string $clientMessage, int $httpCode, string $logMessage): void
+function spoolZipSecurityDiagnostic(array $config, array $uploads): array
 {
-    recordSecurityEvent($config, $logFile, $eventType, $logMessage);
-    httpError($logFile, $clientMessage, $httpCode, $logMessage);
+    $maxBytes = (int) ($config['monitoring']['max_diagnostic_bytes'] ?? 0);
+    $maxStorageBytes = (int) ($config['monitoring']['max_diagnostic_storage_bytes'] ?? (10 * 1024 * 1024));
+    $attachmentDir = $config['monitoring']['event_attachment_dir'] ?? null;
+    if (
+        $maxBytes <= 0
+        || !is_string($attachmentDir)
+        || $attachmentDir === ''
+        || (!class_exists(ZipArchive::class) && !class_exists(PharData::class))
+    ) {
+        return ['status' => 'unavailable'];
+    }
+
+    $candidates = [];
+    $foundTooLarge = false;
+    $foundUnreadable = false;
+    foreach ($uploads as $upload) {
+        if (
+            $upload['error'] !== UPLOAD_ERR_OK
+            || strtolower((string) pathinfo($upload['name'], PATHINFO_EXTENSION)) !== 'zip'
+            || !is_file($upload['tmp_name'])
+        ) {
+            continue;
+        }
+
+        if (class_exists(ZipArchive::class)) {
+            $archive = new ZipArchive();
+            $archiveOpened = false;
+            try {
+                if ($archive->open($upload['tmp_name']) !== true) {
+                    $foundUnreadable = true;
+                    continue;
+                }
+                $archiveOpened = true;
+
+                $entryCount = min($archive->numFiles, SECURITY_DIAGNOSTIC_MAX_ZIP_ENTRIES);
+                for ($index = 0; $index < $entryCount; $index++) {
+                    $stat = $archive->statIndex($index);
+                    if (!is_array($stat) || !isset($stat['name'])) {
+                        continue;
+                    }
+
+                    $entryName = strtolower(basename(str_replace('\\', '/', (string) $stat['name'])));
+                    if (!in_array($entryName, ['bugreport.txt', 'bugreport.log'], true) || isset($candidates[$entryName])) {
+                        continue;
+                    }
+
+                    $entrySize = isset($stat['size']) ? (int) $stat['size'] : -1;
+                    if ($entrySize < 0 || $entrySize > $maxBytes) {
+                        $foundTooLarge = true;
+                        continue;
+                    }
+
+                    $content = $archive->getFromIndex($index, $maxBytes + 1);
+                    if (!is_string($content)) {
+                        $foundUnreadable = true;
+                        continue;
+                    }
+                    if (strlen($content) > $maxBytes) {
+                        $foundTooLarge = true;
+                        continue;
+                    }
+
+                    $candidates[$entryName] = $content;
+                }
+            } catch (Throwable $throwable) {
+                $foundUnreadable = true;
+            } finally {
+                if ($archiveOpened) {
+                    $archive->close();
+                }
+            }
+            continue;
+        }
+
+        if (strtolower((string) pathinfo($upload['tmp_name'], PATHINFO_EXTENSION)) !== 'zip') {
+            $foundUnreadable = true;
+            continue;
+        }
+
+        try {
+            $archive = new PharData($upload['tmp_name']);
+            $entriesSeen = 0;
+            foreach (new RecursiveIteratorIterator($archive) as $entry) {
+                $entriesSeen++;
+                if ($entriesSeen > SECURITY_DIAGNOSTIC_MAX_ZIP_ENTRIES) {
+                    break;
+                }
+
+                if (!$entry instanceof PharFileInfo || !$entry->isFile()) {
+                    continue;
+                }
+
+                $entryName = strtolower($entry->getFilename());
+                if (!in_array($entryName, ['bugreport.txt', 'bugreport.log'], true) || isset($candidates[$entryName])) {
+                    continue;
+                }
+
+                $entrySize = $entry->getSize();
+                if ($entrySize < 0 || $entrySize > $maxBytes) {
+                    $foundTooLarge = true;
+                    continue;
+                }
+
+                $content = readSecurityDiagnosticEntry($entry, $maxBytes);
+                if ($content === null) {
+                    $foundTooLarge = true;
+                    continue;
+                }
+
+                $candidates[$entryName] = $content;
+            }
+            unset($archive);
+        } catch (Throwable $throwable) {
+            $foundUnreadable = true;
+        }
+    }
+
+    $selectedName = isset($candidates['bugreport.txt'])
+        ? 'bugreport.txt'
+        : (isset($candidates['bugreport.log']) ? 'bugreport.log' : null);
+    if ($selectedName === null) {
+        if ($foundTooLarge) {
+            return ['status' => 'skipped_too_large'];
+        }
+
+        return ['status' => $foundUnreadable ? 'unreadable' : 'not_found'];
+    }
+
+    ensureDirectoryExists($attachmentDir);
+    $storedPath = $attachmentDir
+        . DIRECTORY_SEPARATOR
+        . 'security-' . date('Ymd-His') . '-' . bin2hex(random_bytes(8)) . '-' . $selectedName;
+    $content = $candidates[$selectedName];
+    if (directorySize($attachmentDir) + strlen($content) > $maxStorageBytes) {
+        return ['status' => 'storage_limit'];
+    }
+    if (@file_put_contents($storedPath, $content, LOCK_EX) === false) {
+        return ['status' => 'store_failed'];
+    }
+    @chmod($storedPath, 0600);
+
+    return [
+        'status' => 'attached',
+        'attachment' => [
+            'path' => $storedPath,
+            'name' => $selectedName,
+            'size_bytes' => strlen($content),
+        ],
+    ];
+}
+
+/**
+ * @param array<string, mixed> $event
+ */
+function formatSecurityEventForLog(array $event): string
+{
+    $details = isset($event['details']) && is_array($event['details']) ? $event['details'] : [];
+    $parts = [sanitizeSecurityEventValue((string) ($event['message'] ?? 'Security event.'))];
+    foreach (['from_address', 'from_name', 'subject', 'customer_identifier'] as $key) {
+        $value = isset($details[$key]) && is_string($details[$key]) ? $details[$key] : 'not provided';
+        $parts[] = $key . '="' . str_replace('"', "'", $value) . '"';
+    }
+    $parts[] = 'request_size_bytes=' . (int) ($details['request_size_bytes'] ?? 0);
+
+    $attachments = isset($details['attachments']) && is_array($details['attachments']) ? $details['attachments'] : [];
+    foreach ($attachments as $attachment) {
+        if (!is_array($attachment)) {
+            continue;
+        }
+        $parts[] = sprintf(
+            'attachment="%s, %d bytes, %s"',
+            str_replace('"', "'", (string) ($attachment['name'] ?? 'unnamed')),
+            (int) ($attachment['size_bytes'] ?? 0),
+            str_replace('"', "'", (string) ($attachment['upload_status'] ?? 'unknown'))
+        );
+    }
+
+    if (isset($details['zip_diagnostic'])) {
+        $parts[] = 'zip_diagnostic="' . str_replace('"', "'", (string) $details['zip_diagnostic']) . '"';
+    }
+
+    return implode(' ', $parts);
+}
+
+/**
+ * @param array<string, mixed> $config
+ * @param list<array{name:string,tmp_name:string,error:int,size:int}>|null $uploads
+ * @return array<string, mixed>
+ */
+function recordSecurityEvent(array $config, ?string $logFile, string $eventType, string $message, ?array $uploads = null): array
+{
+    $details = collectRequestSecurityDetails($uploads);
+    $diagnostic = null;
+    if (in_array($eventType, ['request_too_large', 'attachment_too_large'], true)) {
+        $diagnostic = spoolZipSecurityDiagnostic($config, $uploads ?? normalizeIncomingUploads($_FILES ?? []));
+        $details['zip_diagnostic'] = $diagnostic['status'];
+    }
+
+    $event = [
+        'timestamp' => date('Y-m-d H:i:s'),
+        'ip' => sanitizeSecurityEventValue((string) ($_SERVER['REMOTE_ADDR'] ?? 'CLI'), 64),
+        'type' => sanitizeSecurityEventValue($eventType, 100),
+        'message' => sanitizeSecurityEventValue($message),
+        'details' => $details,
+    ];
+    if (is_array($diagnostic) && isset($diagnostic['attachment']) && is_array($diagnostic['attachment'])) {
+        $event['diagnostic_attachment'] = $diagnostic['attachment'];
+    }
+
+    $eventLog = $config['monitoring']['event_log_file'] ?? null;
+    if (!is_string($eventLog) || $eventLog === '') {
+        writeMailerLog($logFile, 'SECURITY ' . $eventType . ': ' . formatSecurityEventForLog($event));
+        return $event;
+    }
+
+    ensureDirectoryExists(dirname($eventLog));
+    $line = json_encode($event, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+    if (!is_string($line) || @file_put_contents($eventLog, $line . "\n", FILE_APPEND | LOCK_EX) === false) {
+        writeMailerLog($logFile, 'SECURITY ' . $eventType . ': ' . formatSecurityEventForLog($event));
+    }
+
+    return $event;
+}
+
+/**
+ * @param array<string, mixed> $config
+ * @param list<array{name:string,tmp_name:string,error:int,size:int}>|null $uploads
+ */
+function rejectRequest(
+    array $config,
+    ?string $logFile,
+    string $eventType,
+    string $clientMessage,
+    int $httpCode,
+    string $logMessage,
+    ?array $uploads = null
+): void {
+    $event = recordSecurityEvent($config, $logFile, $eventType, $logMessage, $uploads);
+    httpError($logFile, $clientMessage, $httpCode, formatSecurityEventForLog($event));
 }
 
 /**
@@ -602,7 +932,7 @@ function validateRequestLimits(array $config, array $uploads, string $remoteIp, 
 {
     $contentLength = isset($_SERVER['CONTENT_LENGTH']) ? (int) $_SERVER['CONTENT_LENGTH'] : 0;
     if ($contentLength > (int) $config['request_limits']['max_request_bytes']) {
-        rejectRequest($config, $logFile, 'request_too_large', 'Request too large', 413, 'Rejected oversized request.');
+        rejectRequest($config, $logFile, 'request_too_large', 'Request too large', 413, 'Rejected oversized request.', $uploads);
     }
 
     $actualUploads = [];
@@ -620,7 +950,15 @@ function validateRequestLimits(array $config, array $uploads, string $remoteIp, 
     foreach ($actualUploads as $upload) {
         $uploadBytes += max(0, (int) $upload['size']);
         if ($upload['size'] > (int) $config['request_limits']['max_attachment_bytes']) {
-            rejectRequest($config, $logFile, 'attachment_too_large', 'Attachment too large', 413, "Rejected oversized attachment '{$upload['name']}'");
+            rejectRequest(
+                $config,
+                $logFile,
+                'attachment_too_large',
+                'Attachment too large',
+                413,
+                "Rejected oversized attachment '{$upload['name']}'",
+                $uploads
+            );
         }
 
         if ($upload['error'] !== UPLOAD_ERR_OK) {
@@ -1166,6 +1504,10 @@ function runQueueMaintenance(PDO $pdo, array $config, ?string $logFile): void
 {
     rotateLogFile($config['log_file'], (int) $config['log_rotation_max_bytes']);
     removeExpiredRotatedLogs($config['log_file'], (int) $config['maintenance']['log_retention_days']);
+    removeExpiredSecurityEventAttachments(
+        (string) $config['monitoring']['event_attachment_dir'],
+        (int) $config['maintenance']['log_retention_days']
+    );
 
     resetStaleSendingReports($pdo, (int) $config['maintenance']['stale_sending_after_seconds']);
     cleanupRetiredReports($pdo, 'sent', (int) $config['maintenance']['sent_report_retention_days'], $logFile);
@@ -1177,6 +1519,193 @@ function runQueueMaintenance(PDO $pdo, array $config, ?string $logFile): void
     }
 
     writeMailerLog($logFile, 'Queue maintenance finished successfully.');
+}
+
+/**
+ * @return array<string, mixed>|null
+ */
+function parseSecurityEventLine(string $line): ?array
+{
+    try {
+        $event = json_decode($line, true, 512, JSON_THROW_ON_ERROR);
+    } catch (Throwable $throwable) {
+        return null;
+    }
+
+    return is_array($event) && isset($event['type'], $event['message']) ? $event : null;
+}
+
+/**
+ * @param array<string, mixed> $event
+ */
+function formatSecurityEventForDigest(array $event): string
+{
+    $details = isset($event['details']) && is_array($event['details']) ? $event['details'] : [];
+    $value = static function (string $key) use ($details): string {
+        return isset($details[$key]) && is_string($details[$key]) && $details[$key] !== ''
+            ? $details[$key]
+            : '(not provided)';
+    };
+
+    $lines = [sprintf(
+        '[%s] [%s] [%s] %s',
+        (string) ($event['timestamp'] ?? 'unknown time'),
+        (string) ($event['ip'] ?? 'unknown IP'),
+        (string) ($event['type'] ?? 'unknown event'),
+        (string) ($event['message'] ?? 'Security event.')
+    )];
+    $lines[] = '  From address: ' . $value('from_address');
+    $lines[] = '  From name: ' . $value('from_name');
+    $lines[] = '  Subject: ' . $value('subject');
+    $lines[] = '  Customer: ' . $value('customer_identifier');
+    $lines[] = '  Request size: ' . (int) ($details['request_size_bytes'] ?? 0) . ' bytes';
+
+    $attachments = isset($details['attachments']) && is_array($details['attachments']) ? $details['attachments'] : [];
+    if ($attachments === []) {
+        $lines[] = '  Attachments: (none reported)';
+    } else {
+        foreach ($attachments as $attachment) {
+            if (!is_array($attachment)) {
+                continue;
+            }
+            $lines[] = sprintf(
+                '  Attachment: %s, %d bytes, %s',
+                (string) ($attachment['name'] ?? 'unnamed'),
+                (int) ($attachment['size_bytes'] ?? 0),
+                (string) ($attachment['upload_status'] ?? 'unknown status')
+            );
+        }
+    }
+    if (isset($details['attachments_omitted'])) {
+        $lines[] = '  Attachments omitted from log: ' . (int) $details['attachments_omitted'];
+    }
+
+    if (isset($details['zip_diagnostic'])) {
+        $lines[] = '  ZIP diagnostic: ' . (string) $details['zip_diagnostic'];
+    }
+
+    return implode("\n", $lines);
+}
+
+function resolveSecurityEventAttachmentPath(string $path, string $attachmentDir): ?string
+{
+    $resolvedDirectory = realpath($attachmentDir);
+    $resolvedPath = realpath($path);
+    if ($resolvedDirectory === false || $resolvedPath === false || !is_file($resolvedPath)) {
+        return null;
+    }
+
+    $prefix = rtrim($resolvedDirectory, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+    if (DIRECTORY_SEPARATOR === '\\') {
+        return strncasecmp($resolvedPath, $prefix, strlen($prefix)) === 0 ? $resolvedPath : null;
+    }
+
+    return strpos($resolvedPath, $prefix) === 0 ? $resolvedPath : null;
+}
+
+/**
+ * @param array<string, mixed> $config
+ * @param list<string> $lines
+ */
+function buildSecurityDigestEmail(array $config, array $lines, int $omitted): Email
+{
+    $body = "Security events were recorded by the bug report mailer.\n\n";
+    if ($omitted > 0) {
+        $body .= "{$omitted} older event(s) were omitted.\n\n";
+    }
+
+    $formattedEvents = [];
+    foreach ($lines as $line) {
+        $event = parseSecurityEventLine($line);
+        $formattedEvents[] = $event === null ? $line : formatSecurityEventForDigest($event);
+    }
+    $body .= implode("\n\n", $formattedEvents);
+
+    $email = (new Email())
+        ->from($config['sender'])
+        ->to($config['my_email'])
+        ->subject('Bug report mailer security digest')
+        ->text($body);
+
+    $attachmentDir = (string) ($config['monitoring']['event_attachment_dir'] ?? '');
+    $maxBytes = (int) ($config['monitoring']['max_diagnostic_bytes'] ?? 0);
+    $maxTotalBytes = (int) ($config['monitoring']['max_diagnostic_storage_bytes'] ?? (10 * 1024 * 1024));
+    $totalAttachedBytes = 0;
+    $attachedPaths = [];
+    foreach ($lines as $line) {
+        $event = parseSecurityEventLine($line);
+        $attachment = is_array($event) && isset($event['diagnostic_attachment']) && is_array($event['diagnostic_attachment'])
+            ? $event['diagnostic_attachment']
+            : null;
+        if ($attachment === null || !isset($attachment['path']) || !is_string($attachment['path'])) {
+            continue;
+        }
+
+        $resolvedPath = resolveSecurityEventAttachmentPath($attachment['path'], $attachmentDir);
+        if ($resolvedPath === null || isset($attachedPaths[$resolvedPath])) {
+            continue;
+        }
+
+        $size = filesize($resolvedPath);
+        if ($size === false || $size > $maxBytes || $totalAttachedBytes + $size > $maxTotalBytes) {
+            continue;
+        }
+
+        $content = file_get_contents($resolvedPath);
+        if (!is_string($content) || strlen($content) > $maxBytes) {
+            continue;
+        }
+
+        $name = strtolower((string) ($attachment['name'] ?? 'bugreport.txt'));
+        if (!in_array($name, ['bugreport.txt', 'bugreport.log'], true)) {
+            $name = 'bugreport.txt';
+        }
+        $email->attach($content, $name, 'text/plain');
+        $attachedPaths[$resolvedPath] = true;
+        $totalAttachedBytes += $size;
+    }
+
+    return $email;
+}
+
+/**
+ * @param list<string> $lines
+ */
+function cleanupSecurityEventAttachments(array $lines, string $attachmentDir): void
+{
+    foreach ($lines as $line) {
+        $event = parseSecurityEventLine($line);
+        $attachment = is_array($event) && isset($event['diagnostic_attachment']) && is_array($event['diagnostic_attachment'])
+            ? $event['diagnostic_attachment']
+            : null;
+        if ($attachment === null || !isset($attachment['path']) || !is_string($attachment['path'])) {
+            continue;
+        }
+
+        $resolvedPath = resolveSecurityEventAttachmentPath($attachment['path'], $attachmentDir);
+        if ($resolvedPath !== null) {
+            @unlink($resolvedPath);
+        }
+    }
+}
+
+function removeExpiredSecurityEventAttachments(string $attachmentDir, int $retentionDays): void
+{
+    if (!is_dir($attachmentDir)) {
+        return;
+    }
+
+    $files = glob(rtrim($attachmentDir, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'security-*');
+    if ($files === false) {
+        return;
+    }
+
+    $cutoff = time() - ($retentionDays * 86400);
+    foreach ($files as $file) {
+        if (is_file($file) && filemtime($file) < $cutoff) {
+            @unlink($file);
+        }
+    }
 }
 
 /**
@@ -1203,18 +1732,7 @@ function sendSecurityDigest(array $config, ?string $logFile): void
     $maxLines = (int) $config['monitoring']['max_digest_lines'];
     $selected = array_slice($lines, -$maxLines);
     $omitted = max(0, count($lines) - count($selected));
-    $body = "Security events were recorded by the bug report mailer.\n\n";
-    if ($omitted > 0) {
-        $body .= "Showing the newest {$maxLines} event(s); {$omitted} older event(s) omitted.\n\n";
-    }
-
-    $body .= implode("\n", $selected);
-
-    $email = (new Email())
-        ->from($config['sender'])
-        ->to($config['my_email'])
-        ->subject('Bug report mailer security digest')
-        ->text($body);
+    $email = buildSecurityDigestEmail($config, $selected, $omitted);
 
     $transport = Transport::fromDsn($config['mailer_dsn']);
     $mailer = new Mailer($transport);
@@ -1225,6 +1743,7 @@ function sendSecurityDigest(array $config, ?string $logFile): void
         @file_put_contents($lastDigestFile, (string) time(), LOCK_EX);
     }
 
+    cleanupSecurityEventAttachments($lines, (string) $config['monitoring']['event_attachment_dir']);
     @file_put_contents($eventLog, '', LOCK_EX);
     writeMailerLog($logFile, 'Sent security digest with ' . count($lines) . ' event(s).');
 }

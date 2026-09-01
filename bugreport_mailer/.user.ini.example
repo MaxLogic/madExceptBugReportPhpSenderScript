@@ -2,3 +2,5 @@ log_errors = On
 error_log = php_errors.log
 error_reporting = E_ALL
 display_errors = Off
+upload_max_filesize = 50M
+post_max_size = 64M
